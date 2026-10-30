@@ -387,3 +387,362 @@ app.post('/api/admin/login', async (req, res, next) => {
     next(error);
   }
 });
+
+
+// Admin logout
+app.post('/api/admin/logout', (_req, res) => {
+  res.clearCookie('tw_admin', {
+    httpOnly: true,
+    secure: isProd,
+    sameSite: isProd ? 'none' : 'lax',
+    path: '/',
+  });
+
+  res.json({ message: 'Signed out successfully.' });
+});
+
+// Admin profile
+app.get('/api/admin/me', requireAdmin, (req, res) => {
+  res.json({ admin: safeAdmin(req.admin) });
+});
+
+// Dashboard statistics
+app.get('/api/admin/stats', requireAdmin, async (_req, res, next) => {
+  try {
+    const [
+      totalApplications,
+      pendingApplications,
+      approvedApplications,
+      rejectedApplications,
+      totalAwards,
+      totalTeamMembers,
+      totalVideos,
+      totalCertificates,
+    ] = await Promise.all([
+      Application.countDocuments(),
+      Application.countDocuments({ status: 'Pending' }),
+      Application.countDocuments({ status: 'Approved' }),
+      Application.countDocuments({ status: 'Rejected' }),
+      Award.countDocuments(),
+      TeamMember.countDocuments(),
+      Video.countDocuments(),
+      Certificate.countDocuments(),
+    ]);
+
+    res.json({
+      totalApplications,
+      pendingApplications,
+      approvedApplications,
+      rejectedApplications,
+      totalAwards,
+      totalTeamMembers,
+      totalVideos,
+      totalCertificates,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Admin applications list
+app.get('/api/admin/applications', requireAdmin, async (req, res, next) => {
+  try {
+    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(
+      100,
+      Math.max(1, Number.parseInt(req.query.limit, 10) || 50)
+    );
+
+    const filter = {};
+    const status = String(req.query.status || '').trim();
+    const search = String(req.query.search || '').trim();
+
+    if (status && status !== 'All') {
+      filter.status = status;
+    }
+
+    if (search) {
+      const safeSearch = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+      filter.$or = [
+        { fullName: { $regex: safeSearch, $options: 'i' } },
+        { email: { $regex: safeSearch, $options: 'i' } },
+        { applicationNo: { $regex: safeSearch, $options: 'i' } },
+        { recordTitle: { $regex: safeSearch, $options: 'i' } },
+      ];
+    }
+
+    const [items, total] = await Promise.all([
+      Application.find(filter)
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit),
+      Application.countDocuments(filter),
+    ]);
+
+    res.json({
+      items,
+      total,
+      page,
+      pages: Math.ceil(total / limit),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Approve or reject applications
+app.patch(
+  '/api/admin/applications/:id/review',
+  requireAdmin,
+  async (req, res, next) => {
+    try {
+      const parsed = z
+        .object({
+          status: z.enum(['Approved', 'Rejected']),
+          reviewNote: z.string().trim().max(2000).optional().default(''),
+        })
+        .safeParse(req.body);
+
+      if (!parsed.success) {
+        return res.status(400).json({
+          message: 'Invalid review details.',
+        });
+      }
+
+      const application = await Application.findById(req.params.id);
+
+      if (!application) {
+        return res.status(404).json({
+          message: 'Application not found.',
+        });
+      }
+
+      application.status = parsed.data.status;
+      application.reviewNote = parsed.data.reviewNote;
+      application.reviewedAt = new Date();
+
+      if (
+        parsed.data.status === 'Approved' &&
+        !application.certificateNo
+      ) {
+        application.certificateNo =
+          `TWR-${new Date().getFullYear()}-${randomUUID()
+            .slice(0, 8)
+            .toUpperCase()}`;
+      }
+
+      await application.save();
+
+      res.json({
+        message: 'Application review updated.',
+        application,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// Admin content management
+function registerAdminCollection({
+  route,
+  Model,
+  requiredFields = [],
+  sort = { createdAt: -1 },
+}) {
+  app.get(`/api/admin/${route}`, requireAdmin, async (_req, res, next) => {
+    try {
+      const items = await Model.find().sort(sort);
+      res.json(items);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post(`/api/admin/${route}`, requireAdmin, async (req, res, next) => {
+    try {
+      for (const field of requiredFields) {
+        if (
+          req.body[field] === undefined ||
+          req.body[field] === null ||
+          String(req.body[field]).trim() === ''
+        ) {
+          return res.status(400).json({
+            message: `${field} is required.`,
+          });
+        }
+      }
+
+      const item = await Model.create(req.body);
+      res.status(201).json(item);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.put(
+    `/api/admin/${route}/:id`,
+    requireAdmin,
+    async (req, res, next) => {
+      try {
+        const item = await Model.findByIdAndUpdate(
+          req.params.id,
+          req.body,
+          { new: true, runValidators: true }
+        );
+
+        if (!item) {
+          return res.status(404).json({
+            message: 'Item not found.',
+          });
+        }
+
+        res.json(item);
+      } catch (error) {
+        next(error);
+      }
+    }
+  );
+
+  app.delete(
+    `/api/admin/${route}/:id`,
+    requireAdmin,
+    async (req, res, next) => {
+      try {
+        const item = await Model.findByIdAndDelete(req.params.id);
+
+        if (!item) {
+          return res.status(404).json({
+            message: 'Item not found.',
+          });
+        }
+
+        res.json({ message: 'Deleted successfully.' });
+      } catch (error) {
+        next(error);
+      }
+    }
+  );
+}
+
+registerAdminCollection({
+  route: 'awards',
+  Model: Award,
+  requiredFields: ['title'],
+  sort: { year: -1, createdAt: -1 },
+});
+
+registerAdminCollection({
+  route: 'team',
+  Model: TeamMember,
+  requiredFields: ['name'],
+});
+
+registerAdminCollection({
+  route: 'videos',
+  Model: Video,
+  requiredFields: ['title'],
+});
+
+registerAdminCollection({
+  route: 'certificates',
+  Model: Certificate,
+  requiredFields: ['certificateNo', 'holderName'],
+});
+
+registerAdminCollection({
+  route: 'announcements',
+  Model: Announcement,
+  requiredFields: ['title'],
+});
+
+// Admin file upload
+app.post(
+  '/api/admin/upload',
+  requireAdmin,
+  upload.single('file'),
+  (req, res) => {
+    if (!req.file) {
+      return res.status(400).json({
+        message: 'Please select a file.',
+      });
+    }
+
+    const fileUrl =
+      `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+
+    res.status(201).json({
+      message: 'File uploaded successfully.',
+      url: fileUrl,
+      filename: req.file.filename,
+      mimetype: req.file.mimetype,
+      size: req.file.size,
+    });
+  }
+);
+
+// Unknown API route
+app.use('/api', (_req, res) => {
+  res.status(404).json({
+    message: 'API route not found.',
+  });
+});
+
+// Error handler
+app.use((error, _req, res, _next) => {
+  console.error('API error:', error);
+
+  if (error.code === 11000) {
+    return res.status(409).json({
+      message: 'A record with this value already exists.',
+    });
+  }
+
+  if (error.name === 'ValidationError') {
+    return res.status(400).json({
+      message: error.message,
+    });
+  }
+
+  if (error.name === 'CastError') {
+    return res.status(400).json({
+      message: 'Invalid ID or value.',
+    });
+  }
+
+  if (error instanceof multer.MulterError) {
+    return res.status(400).json({
+      message: error.message,
+    });
+  }
+
+  res.status(500).json({
+    message: isProd
+      ? 'Something went wrong on the server.'
+      : error.message || 'Unexpected server error.',
+  });
+});
+
+// Connect MongoDB and start the server
+async function startServer() {
+  try {
+    console.log('Connecting to MongoDB Atlas...');
+
+    await mongoose.connect(process.env.MONGO_URI, {
+      serverSelectionTimeoutMS: 15000,
+    });
+
+    console.log('MongoDB connected successfully.');
+
+    app.listen(port, '0.0.0.0', () => {
+      console.log(`Triumph World Records API listening on ${port}`);
+    });
+  } catch (error) {
+    console.error('Server startup failed:', error);
+    process.exit(1);
+  }
+}
+
+startServer();
+
